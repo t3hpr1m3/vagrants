@@ -1,0 +1,137 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+def hostname(node)
+  "#{node.to_s}.smartengine.local"
+end
+
+def build_node(base_name, ip_offset, num)
+  nodeName = (base_name + num.to_s).to_sym
+  { name: nodeName, hostname: hostname(nodeName), ip_address: IP_ADDRESS_PREFIX + ip_offset.to_s + num.to_s }
+end
+
+IP_ADDRESS_PREFIX = '10.11.12.'
+
+COUCH_NODE_COUNT = 0
+COUCH_NODES = 1.upto(COUCH_NODE_COUNT).collect do |n|
+  build_node('couch', 2, n)
+end
+
+ELASTIC_NODE_COUNT = 2
+ELASTIC_NODES = 1.upto(ELASTIC_NODE_COUNT).collect do |n|
+  build_node('elastic', 3, n)
+end
+
+Vagrant.configure("2") do |config|
+
+  config.vm.box_url = "http://files.vagrantup.com/precise64.box"
+  config.hostmanager.enabled = true
+  config.hostmanager.manage_host = true
+  config.ssh.forward_agent = true
+  config.ssh.forward_x11 = true
+
+  config.vm.provider :virtualbox do |vb|
+    vb.customize ['modifyvm', :id, '--natdnshostresolver1', 'on']
+    vb.customize ['modifyvm', :id, '--natdnsproxy1', 'on']
+  end
+
+  config.vm.boot_timeout = 120
+
+  config.omnibus.chef_version = :latest
+
+  if Vagrant.has_plugin?('vagrant-cachier')
+    config.cache.scope = :box
+    config.cache.synced_folder_opts = {
+      type: :nfs,
+      mount_options: ['rw', 'vers=3', 'tcp', 'nolock']
+    }
+  end
+
+  if Vagrant.has_plugin?('berkshelf')
+    config.berkshelf.enabled = true
+  end
+
+  config.vm.define :app do |node|
+    node.vm.box = 'precise64'
+    node.vm.hostname = hostname('app') 
+    node.vm.network :private_network, ip: IP_ADDRESS_PREFIX + '10'
+    node.vm.network 'forwarded_port', guest: 3001, host: 3001
+    node.vm.synced_folder '/Users/jdubz/code', '/vagrant', type: 'nfs'
+
+    node.vm.provider :virtualbox do |vb|
+      vb.cpus = 4
+      vb.memory = 1024
+    end
+
+    node.vm.provision :chef_solo do |chef|
+      chef.run_list = [
+        'recipe[smartengine::base]',
+        'recipe[smartengine::app]',
+        'recipe[smartengine::moses]',
+        'recipe[smartengine::couchdb_proxy]',
+        'recipe[smartengine::search_proxy]'
+      ]
+      chef.json = {
+        'couchbase' => {
+          'couch_nodes' => COUCH_NODES.collect { |n| n[:ip_address] }
+        },
+        'elasticsearch' => {
+          'elastic_nodes' => ELASTIC_NODES.collect { |n| n[:ip_address] }
+        }
+      }
+    end
+  end
+
+  COUCH_NODES.each_with_index do |n, idx|
+    config.vm.define n[:name] do |node|
+      node.vm.box = 'precise64'
+      node.vm.hostname = n[:hostname]
+      node.vm.network :private_network, ip: n[:ip_address]
+      if idx.eql?(0)
+        node.vm.network 'forwarded_port', guest: 8091, host: 8091
+        node.vm.network 'forwarded_port', guest: 8092, host: 8092
+        node.vm.network 'forwarded_port', guest: 11210, host: 11210
+        node.vm.network 'forwarded_port', guest: 11211, host: 11211
+      end
+      node.vm.provider :virtualbox do |vb|
+        vb.memory = 2048
+      end
+
+      node.vm.provision :chef_solo do |chef|
+        chef.run_list = [
+          'recipe[smartengine::base]',
+          'recipe[smartengine::couchdb]'
+        ]
+      end
+    end
+  end
+
+  ELASTIC_NODES.each_with_index do |n, idx|
+    config.vm.define n[:name] do |node|
+      node.vm.box = 'precise64'
+      node.vm.hostname = n[:hostname]
+      node.vm.network :private_network, ip: n[:ip_address]
+      if idx.eql?(0)
+        node.vm.network 'forwarded_port', guest: 9200, host: 9200
+      end
+      node.vm.provider :virtualbox do |vb|
+        vb.memory = 1536
+      end
+
+      node.vm.provision :chef_solo do |chef|
+        chef.run_list = [
+          'recipe[smartengine::base]',
+          'recipe[smartengine::search]'
+        ]
+        chef.json = {
+          'elasticsearch' => {
+            'network' => {
+              'publish_host' => n[:ip_address],
+            }
+          } 
+        }
+      end
+    end
+  end
+end
+
